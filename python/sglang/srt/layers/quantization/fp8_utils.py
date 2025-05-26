@@ -45,6 +45,21 @@ if _is_cuda:
 
 use_vllm_cutlass_w8a8_fp8_kernel = get_bool_env_var("USE_VLLM_CUTLASS_W8A8_FP8_KERNEL")
 
+_is_hip = is_hip()
+if _is_hip and get_bool_env_var("AITER_MOE"):
+    from aiter import gemm_a8w8_blockscale_wpreshuffle_CK
+
+_is_cuda = is_cuda()
+if _is_cuda:
+    from sgl_kernel import fp8_blockwise_scaled_mm
+
+    from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_quant_fp8
+
+    if use_vllm_cutlass_w8a8_fp8_kernel and VLLM_AVAILABLE:
+        from vllm import _custom_ops as ops
+    else:
+        from sgl_kernel import fp8_scaled_mm
+
 # Input scaling factors are no longer optional in _scaled_mm starting
 # from pytorch 2.5. Allocating a dummy tensor to pass as input_scale
 TORCH_DEVICE_IDENTITY = None
@@ -152,12 +167,7 @@ def apply_w8a8_block_fp8_linear(
         q_input, x_scale = per_token_group_quant_fp8(
             input_2d, block_size[1], column_major_scales=False
         )
-        output = torch.zeros(
-            [q_input.shape[0], weight.shape[0]],
-            dtype=input.dtype,
-            device=q_input.device,
-        )
-        gemm_a8w8_blockscale(q_input, weight, x_scale, weight_scale, output)
+        output = gemm_a8w8_blockscale_wpreshuffle_CK(q_input, weight, x_scale, weight_scale, dtype=input.dtype)
     else:
         if _ENABLE_JIT_DEEPGEMM:
             q_input, x_scale = sglang_per_token_group_quant_fp8(

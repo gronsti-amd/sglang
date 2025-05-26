@@ -73,6 +73,12 @@ from sglang.srt.utils import (
 )
 
 _is_hip = is_hip()
+
+if _is_hip:
+    from aiter import biased_grouped_topk
+    from aiter.fused_moe_bf16_asm import asm_moe
+    from aiter.ops.shuffle import shuffle_weight
+
 _is_cuda = is_cuda()
 
 _is_fp8_fnuz = is_fp8_fnuz()
@@ -321,6 +327,12 @@ class Fp8LinearMethod(LinearMethodBase):
                 )
 
                 layer.input_scale = None
+
+                if get_bool_env_var("AITER_MOE"):
+                    # Pre-shuffle weights
+                    layer.weight.data = shuffle_weight(
+                        layer.weight.contiguous(), (16, 16)
+                    )
             else:
                 weight, weight_scale = layer.weight.data, layer.weight_scale_inv.data
             layer.weight = torch.nn.Parameter(weight, requires_grad=False)
@@ -480,8 +492,11 @@ class Fp8MoEMethod:
         hidden_size: int,
         intermediate_size: int,
         params_dtype: torch.dtype,
+        num_shared_experts: Optional[int] = 0,
         **extra_weight_attrs,
     ):
+        if _is_hip and get_bool_env_var("AITER_MOE"):
+            num_experts += num_shared_experts
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         if self.quant_config.is_checkpoint_fp8_serialized:
@@ -947,98 +962,35 @@ class Fp8MoEMethod:
         from sglang.srt.layers.moe.topk import select_experts
 
         # Expert selection
-        topk_weights, topk_ids = select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-            use_grouped_topk=use_grouped_topk,
-            top_k=top_k,
-            renormalize=renormalize,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            custom_routing_function=custom_routing_function,
-            correction_bias=correction_bias,
-            routed_scaling_factor=routed_scaling_factor,
-        )
-
-        if _is_hip:
-            ret = self.maybe_apply_hip_fused_experts(
-                layer,
-                x,
-                topk_weights,
-                topk_ids,
-                activation,
-                no_combine,
+        if _is_hip and get_bool_env_var("AITER_MOE") and correction_bias is not None:
+            token = x.shape[0]
+            biased_grouped_topk(
+                router_logits,
+                correction_bias,
+                layer.ns_topk_weights[:token],
+                layer.ns_topk_ids[:token],
+                num_expert_group,
+                topk_group,
+                renormalize,
+                layer.routed_scaling_factor,
             )
-            if ret is not None:
-                return ret
-
-        if (
-            get_bool_env_var("CUTLASS_MOE")
-            and self.cutlass_fp8_supported
-            and self.block_quant
-            and is_sm100_supported()
-        ):
-            from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts
-
-            return cutlass_fused_experts(
-                x,
-                layer.w13_weight.transpose(1, 2),
-                layer.w2_weight.transpose(1, 2),
-                layer.w13_weight_scale_inv.transpose(1, 2),
-                layer.w2_weight_scale_inv.transpose(1, 2),
-                topk_weights,
-                topk_ids,
-                self.ab_strides1,
-                self.c_strides1,
-                self.ab_strides2,
-                self.c_strides2,
-                self.workspace,
-                self.a_ptr,
-                self.b_ptr,
-                self.out_ptr,
-                self.a_scales_ptr,
-                self.b_scales_ptr,
-                self.expert_offsets,
-                self.problem_sizes1,
-                self.problem_sizes2,
-                use_fp8_blockscale=True,
+            topk_ids = layer.total_topk_ids[:token]
+            topk_weights = layer.total_topk_weights[:token]
+        else:
+            topk_weights, topk_ids = select_experts(
+                hidden_states=x,
+                router_logits=router_logits,
+                use_grouped_topk=use_grouped_topk,
+                top_k=top_k,
+                renormalize=renormalize,
+                topk_group=topk_group,
+                num_expert_group=num_expert_group,
+                custom_routing_function=custom_routing_function,
+                correction_bias=correction_bias,
             )
-        # Expert fusion with FP8 quantization
-        return fused_experts(
-            x,
-            layer.w13_weight,
-            layer.w2_weight,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            inplace=inplace and not no_combine,
-            activation=activation,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            use_fp8_w8a8=True,
-            w1_scale=(
-                layer.w13_weight_scale_inv
-                if self.block_quant
-                else layer.w13_weight_scale
-            ),
-            w2_scale=(
-                layer.w2_weight_scale_inv if self.block_quant else layer.w2_weight_scale
-            ),
-            a1_scale=layer.w13_input_scale,
-            a2_scale=layer.w2_input_scale,
-            block_shape=self.quant_config.weight_block_size,
-            no_combine=no_combine,
-        )
 
-    def maybe_apply_hip_fused_experts(
-        self,
-        layer: torch.nn.Module,
-        x: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-        activation: str = "silu",
-        no_combine: bool = False,
-    ) -> Optional[torch.Tensor]:
-        if use_hip_int4:
-            # TODO: add triton kernel and add check use_aiter_moe
+        if _is_hip and get_bool_env_var("USE_INT4_WEIGHT"):
+            # TODO: add triton kernel and add check get_bool_env_var("AITER_MOE")
             assert not no_combine, f"{no_combine=} is not supported."
             return ck_moe_2stages(
                 x,

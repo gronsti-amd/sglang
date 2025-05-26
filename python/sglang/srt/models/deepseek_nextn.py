@@ -20,7 +20,12 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+    get_tp_group,
+    tensor_model_parallel_all_reduce,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -32,7 +37,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer, DeepseekV3ForCausalLM
-from sglang.srt.utils import BumpAllocator, add_prefix
+from sglang.srt.utils import BumpAllocator, add_prefix, get_bool_env_var, is_cuda, is_hip
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +75,11 @@ class DeepseekModelNextN(nn.Module):
         self.shared_head = nn.Module()
         self.shared_head.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        self.aiter_init = False
+        self.num_experts_per_tok = config.num_experts_per_tok
+        self.n_routed_experts = config.n_routed_experts
+        self.n_shared_experts = config.n_shared_experts
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -89,6 +99,71 @@ class DeepseekModelNextN(nn.Module):
             hidden_states = self.embed_tokens(input_ids)
         else:
             hidden_states = input_embeds
+
+        if _is_hip and get_bool_env_var("AITER_MOE"):
+            model_dim = hidden_states.shape[-1]
+            num_tokens = hidden_states.view(-1, model_dim).shape[0]
+            if not self.aiter_init:
+                self.aiter_init = True
+                tp_rank = get_tensor_model_parallel_rank()
+                tp_size = get_tensor_model_parallel_world_size()
+                top_k = self.num_experts_per_tok
+                num_experts = self.n_routed_experts
+                num_shared_experts = self.n_shared_experts
+                fake_expertid = num_experts + num_shared_experts
+
+                # TODO need find a formal way
+                assert num_tokens <= (4096 * 128)
+                num_tokens = 4096 * 128
+
+                # if enable_ep_moe, need to add shared experts and one fake expert,
+                # otherwise, only add shared experts
+                if global_server_args_dict["enable_ep_moe"]:
+                    num_topK_pad_experts = num_shared_experts + 1
+                else:
+                    num_topK_pad_experts = num_shared_experts
+                # all layers reuse same buffer
+                self.total_topk_ids = torch.empty(
+                    (num_tokens, top_k + num_topK_pad_experts),
+                    dtype=torch.int32,
+                    device="cuda",
+                )
+                self.ns_topk_ids, self.s_topk_ids = self.total_topk_ids.split(
+                    [top_k, num_topK_pad_experts], dim=1
+                )
+                shared_expert_ids = [
+                    num_experts + i for i in range(num_topK_pad_experts)
+                ]
+                if global_server_args_dict["enable_ep_moe"]:
+                    s_topk_ids_list = [
+                        [fake_expertid] * (num_topK_pad_experts)
+                    ] * num_tokens
+                    for i in range(tp_rank, num_tokens, tp_size):
+                        s_topk_ids_list[i] = shared_expert_ids
+                else:
+                    s_topk_ids_list = [shared_expert_ids] * num_tokens
+                self.s_topk_ids[:] = torch.tensor(
+                    s_topk_ids_list, dtype=torch.int32, device="cuda"
+                )
+
+                self.total_topk_weights = torch.empty(
+                    (num_tokens, top_k + num_topK_pad_experts),
+                    dtype=torch.float32,
+                    device="cuda",
+                )
+                self.ns_topk_weights, self.s_topk_weights = (
+                    self.total_topk_weights.split([top_k, num_topK_pad_experts], dim=1)
+                )
+                shared_E_score = 1.0
+                self.s_topk_weights.fill_(shared_E_score)
+
+                # forward to all EP_MOE
+                mlp = self.decoder.mlp
+                # assert isinstance(mlp, DeepseekV2MoE)
+                mlp.experts.total_topk_weights = self.total_topk_weights
+                mlp.experts.total_topk_ids = self.total_topk_ids
+                mlp.experts.ns_topk_weights = self.ns_topk_weights
+                mlp.experts.ns_topk_ids = self.ns_topk_ids
 
         hidden_states = self.eh_proj(
             torch.cat(
@@ -144,6 +219,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                 prefix=add_prefix("model.shared_head.head", prefix),
             )
             self.logits_processor = LogitsProcessor(config)
+        self.aiter_init = False
 
     @torch.no_grad()
     def forward(
@@ -158,7 +234,190 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        super().load_weights(weights, is_nextn=True)
+        if hasattr(self.config, "num_nextn_predict_layers"):
+            num_nextn_layers = self.config.num_nextn_predict_layers
+            assert num_nextn_layers == 1, "Only 1 nextn layer is supportted"
+            assert num_nextn_layers == self.config.num_hidden_layers
+        else:
+            raise ValueError("num_nextn_predict_layers is not in the config")
+
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+
+        # Params for weights, fp8 weight scales, fp8 activation scales
+        # (param_name, weight_name, expert_id, shard_id)
+        MoEImpl = EPMoE if global_server_args_dict["enable_ep_moe"] else FusedMoE
+        expert_params_mapping = MoEImpl.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.n_routed_experts,
+            num_shared_experts=(
+                self.config.n_shared_experts
+                if get_bool_env_var("AITER_MOE") and _is_hip
+                else 0
+            ),
+        )
+
+        nextn_layer_prefix = "model.layers.0"
+        nextn_spec_weight_names = [
+            "shared_head.norm",
+            "eh_proj",
+            "enorm",
+            "hnorm",
+        ]
+
+        params_dict = dict(self.named_parameters())
+        for name, loaded_weight in weights:
+            if not name.startswith(nextn_layer_prefix):
+                continue
+
+            # Use shared head and embed weights from target model
+            if "shared_head.head" in name or "embed_tokens" in name:
+                continue
+
+            is_decoder = True
+            # For nextn specific weights
+            for weight_name in nextn_spec_weight_names:
+                if weight_name in name:
+                    name = name.replace(nextn_layer_prefix, "model")
+                    is_decoder = False
+                    break
+            # For decoder layer weights
+            if is_decoder:
+                name = name.replace(nextn_layer_prefix, "model.decoder")
+
+            if "rotary_emb.inv_freq" in name:
+                continue
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                # Skip non-stacked layers and experts (experts handled below).
+                if weight_name not in name:
+                    continue
+                # We have mlp.experts[0].gate_proj in the checkpoint.
+                # Since we handle the experts below in expert_params_mapping,
+                # we need to skip here BEFORE we update the name, otherwise
+                # name will be updated to mlp.experts[0].gate_up_proj, which
+                # will then be updated below in expert_params_mapping
+                # for mlp.experts[0].gate_gate_up_proj, which breaks load.
+                if ("mlp.experts." in name) and name not in params_dict:
+                    continue
+                if (
+                    _is_hip
+                    and get_bool_env_var("AITER_MOE")
+                    and "mlp.shared_experts" in name
+                ):
+                    continue
+                name = name.replace(weight_name, param_name)
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                for mapping in expert_params_mapping:
+                    param_name, weight_name, expert_id, shard_id = mapping
+                    if weight_name not in name:
+                        continue
+                    name = name.replace(weight_name, param_name)
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    weight_loader(
+                        param,
+                        loaded_weight,
+                        name,
+                        shard_id=shard_id,
+                        expert_id=expert_id,
+                    )
+                    break
+                else:
+                    # Skip loading extra bias for GPTQ models.
+                    if name.endswith(".bias") and name not in params_dict:
+                        continue
+
+                    param = params_dict[name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
+
+        if not global_server_args_dict["disable_mla"]:
+            self_attn = self.model.decoder.self_attn
+            if hasattr(self_attn.kv_b_proj, "qweight"):
+                # AWQ compatible
+                if _is_cuda:
+                    w = awq_dequantize(
+                        self_attn.kv_b_proj.qweight,
+                        self_attn.kv_b_proj.scales,
+                        self_attn.kv_b_proj.qzeros,
+                    ).T
+                else:
+                    w = ops.awq_dequantize(
+                        self_attn.kv_b_proj.qweight,
+                        self_attn.kv_b_proj.scales,
+                        self_attn.kv_b_proj.qzeros,
+                        0,
+                        0,
+                        0,
+                    ).T
+            else:
+                w = self_attn.kv_b_proj.weight
+            # NOTE(HandH1998): Since `bmm_fp8` only supports per-tensor scale, we have to requantize `self_attn.kv_b_proj`.
+            # This may affect the accuracy of fp8 model.
+            if hasattr(self.quant_config, "weight_block_size") and w.dtype in (
+                torch.float8_e4m3fn,
+                torch.float8_e4m3fnuz,
+            ):
+                weight_block_size = self.quant_config.weight_block_size
+                if weight_block_size is not None:
+                    assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
+                    if _is_hip:
+                        weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
+                            weight=w,
+                            weight_scale=self_attn.kv_b_proj.weight_scale_inv,
+                            input_scale=None,
+                        )
+                    else:
+                        weight = w
+                        weight_scale = self_attn.kv_b_proj.weight_scale_inv
+
+                    w, scale = block_quant_to_tensor_quant(
+                        weight, weight_scale, weight_block_size
+                    )
+                    self_attn.w_scale = scale
+            if w.dtype == torch.int8:
+                if hasattr(self.quant_config, "weight_block_size"):
+                    # block-wise int8 need it
+                    weight_block_size = self.quant_config.weight_block_size
+                    if weight_block_size is not None:
+                        assert hasattr(self_attn.kv_b_proj, "weight_scale_inv")
+                        weight = w
+                        weight_scale = self_attn.kv_b_proj.weight_scale_inv
+                        w = int8_block_dequant(
+                            weight, weight_scale, weight_block_size
+                        ).to(torch.bfloat16)
+                else:
+                    # channel-wise int8 need it
+                    assert hasattr(self_attn.kv_b_proj, "weight_scale")
+                    w = w.to(torch.bfloat16) * self_attn.kv_b_proj.weight_scale.to(
+                        torch.bfloat16
+                    )
+            w_kc, w_vc = w.unflatten(
+                0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
+            ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
+            self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
+            self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
+            if (
+                hasattr(self_attn.kv_b_proj, "weight_scale")
+                and self_attn.w_scale is None
+            ):
+                self_attn.w_scale = self_attn.kv_b_proj.weight_scale
+                if _is_hip:
+                    self_attn.w_scale *= 2.0
 
 
 EntryClass = [DeepseekV3ForCausalLMNextN]

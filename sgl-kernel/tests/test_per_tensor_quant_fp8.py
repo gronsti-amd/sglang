@@ -11,6 +11,13 @@ _is_hip = is_hip()
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 
 
+def vllm_scaled_fp8_quant(
+    input: torch.Tensor,
+    scale: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return ops.scaled_fp8_quant(input, scale)
+
+
 def sglang_scaled_fp8_quant(
     input: torch.Tensor,
     scale: Optional[torch.Tensor] = None,
